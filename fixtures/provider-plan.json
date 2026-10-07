@@ -1,0 +1,7 @@
+{
+  "default": "success",
+  "events": {
+    "event-retry": ["503", "429", "success"],
+    "event-permanent": ["422"]
+  }
+}
