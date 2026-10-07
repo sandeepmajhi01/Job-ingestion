@@ -1,322 +1,177 @@
-# Scale Analysis
+# Scale and Performance
 
-## 1. Target
+## 1. Current Implementation
 
-The assignment asks the design to consider growth from:
+The service uses MongoDB as the durable event store and job projection store.
 
-```text
-100,000 events/day
-```
+Background processing is handled by **2 asynchronous worker loops** competing for accepted events.
 
-to:
+Each worker:
 
-```text
-10,000,000 events/day
-```
+1. Claims an available event atomically from MongoDB.
+2. Marks the event as `processing`.
+3. Verifies the job through the provider fixture.
+4. Checks the current job version.
+5. Applies the event only when its version is newer.
+6. Updates the job projection.
+7. Marks the event as `completed`.
 
-with:
+This allows multiple workers to process different events concurrently while preventing two workers from claiming the same event at the same time.
 
-- bursts up to 5,000 events/sec
-- approximately 1 KB average raw event size
-- 7-day raw retention
-- approximately 1 million current jobs
-
----
-
-## 2. Event Rate
-
-### 100,000 events/day
-
-```text
-100,000 / 86,400
-≈ 1.16 events/sec
-```
-
-### 10,000,000 events/day
-
-```text
-10,000,000 / 86,400
-≈ 115.7 events/sec
-```
-
-Therefore the 10M/day average rate is approximately 116 events/sec.
-
-However, the specified 5,000 events/sec burst is much higher than the average and must be treated separately for capacity planning.
+The system also supports retryable provider responses (`429`/`503`), permanent failures (`422`), leases for abandoned processing, event replay detection, and version-safe job projection.
 
 ---
 
-## 3. Raw Storage
+## 2. Local Load Test
 
-At approximately 1 KB per raw event:
+The local benchmark was executed using:
 
-### 100K events/day
+- 1,000 distinct valid events
+- 200 exact replay requests
+- 50 jobs delivered out of order
+- 50 concurrent HTTP requests
+- 2 background workers
+- 500 ms worker polling interval
+- Local MongoDB 8 running through Docker Compose
+- Local fixture-based provider
 
-```text
-100,000 × 1 KB
-≈ 100 MB/day
-```
-
-Seven-day raw retention:
-
-```text
-≈ 700 MB
-```
-
-### 10M events/day
+The 50 versioned jobs were delivered in the order:
 
 ```text
-10,000,000 × 1 KB
-≈ 10 GB/day
+v3 → v1 → v2
 ```
 
-Seven-day raw retention:
-
-```text
-≈ 70 GB
-```
-
-These values represent approximate raw payload volume before MongoDB document overhead, indexes, replication, and storage-engine overhead.
-
-Actual capacity must therefore be provisioned above these estimates.
+The expected final state for all of them was version 3.
 
 ---
 
-## 4. Current Jobs
+## 3. Achieved Results
 
-The assignment targets approximately:
-
-```text
-1,000,000 current jobs
-```
-
-The current job collection uses a unique identity index:
+The load test completed successfully with:
 
 ```text
-tenantId + sourceId + externalJobId
+Distinct events:   1000
+Accepted:          1000
+Exact replays:     200
+Replay 200s:       200
+HTTP errors:       0
+
+Logical jobs:      900
+Out-of-order jobs: 50
+Final v3 jobs:     50
+
+Submission time:   ~2.0 seconds
+Queue drain time:  ~257.3 seconds
 ```
 
-and a read index:
+Additional measured HTTP latency:
 
 ```text
-tenantId + sourceId + status + _id
+Submission p50:    ~101 ms
+Submission p95:    ~188 ms
+
+Replay p50:        ~67 ms
+Replay p95:        ~75 ms
 ```
 
-At larger scale, index size and memory pressure should be measured because indexes directly affect write amplification and storage requirements.
-
----
-
-## 5. Burst Handling
-
-The ingestion endpoint should remain lightweight.
-
-The API performs:
+The observed background processing throughput was approximately:
 
 ```text
-validation
-replay detection
-durable MongoDB insert
+1,000 events / 257.3 seconds
+≈ 3.9 events/second
 ```
 
-It does not wait for provider verification or complete job projection processing before returning `202`.
-
-This separates ingestion throughput from downstream provider-processing throughput.
-
-At 5,000 events/sec bursts, production deployment would require sufficient MongoDB write capacity and horizontally scaled API instances.
+This is a local single-machine measurement and is not presented as production capacity.
 
 ---
 
-## 6. Worker Scaling
+## 4. Correctness Under Load
 
-Workers can be horizontally increased as processing demand grows.
+The benchmark also demonstrated that the processing pipeline maintained the expected final state while handling concurrent ingestion and out-of-order delivery.
 
-The current design uses MongoDB as the durable work store and atomic claims for worker coordination.
+In particular:
 
-Worker capacity should be based on:
+- All 1,000 distinct events were accepted.
+- All 200 exact replays were recognized.
+- No HTTP errors occurred during the load test.
+- 50 versioned jobs were delivered out of order.
+- All 50 eventually reached version 3.
+- No stale version overwrote a newer version.
+- The expected 900 logical jobs were present.
+- No failed events remained from the load test.
+
+This demonstrates that the current worker and versioning model can process concurrent event traffic without losing the final version ordering guarantee.
+
+---
+
+## 5. Current Performance Observation
+
+The current benchmark shows that **event ingestion itself is significantly faster than background projection processing**.
+
+Approximately 1,000 events were submitted in about 2 seconds, while the background queue required approximately 257 seconds to fully settle.
+
+Therefore, the current performance focus is the **worker-processing path**, rather than the initial HTTP acceptance path.
+
+---
+
+## 6. Future Scaling Approach
+
+The current implementation is intentionally conservative. Future performance improvements will focus on increasing worker throughput while preserving the existing correctness guarantees.
+
+The main areas for optimization are:
+
+### Worker concurrency
+
+Increase the number of concurrent worker loops and benchmark the point at which additional workers stop providing useful throughput.
+
+### Worker polling
+
+Reduce unnecessary waiting when work is already available. Workers should be able to immediately claim another event after finishing the previous one and only wait when no work is available.
+
+### Provider fixture loading
+
+The provider fixture is static during a run. Loading and parsing it for every verification introduces unnecessary filesystem and JSON parsing overhead. It can be loaded once and reused in memory.
+
+### Database operations
+
+Review the event-processing path to identify unnecessary MongoDB reads and combine operations where possible without weakening:
+
+- atomic claiming
+- version ordering
+- replay safety
+- crash recovery
+- lease recovery
+
+### MongoDB indexes
+
+Optimize indexes supporting worker claims, retry scheduling, lease recovery, and job reads as throughput increases.
+
+### Connection and resource tuning
+
+As worker concurrency increases, MongoDB connection-pool sizing and other resource limits should be measured and tuned rather than increased blindly.
+
+### Horizontal scaling
+
+For larger workloads, worker processes can be scaled across multiple application instances. MongoDB remains the coordination point for durable work claiming and job state.
+
+---
+
+## 7. Scaling Principle
+
+Performance changes will be evaluated using the same reproducible workload and actual measurements.
+
+The goal is not simply to add more workers. The goal is to identify the actual bottleneck and increase throughput while maintaining:
 
 ```text
-incoming event rate
-+
-retry rate
-+
-average provider latency
+Durable acceptance
+        +
+Safe concurrent claiming
+        +
+Version-correct projection
+        +
+Retry/recovery guarantees
+        =
+Reliable scalable ingestion
 ```
 
-The system should monitor backlog size and processing latency.
-
----
-
-## 7. Backpressure
-
-At high ingestion rates, MongoDB write capacity becomes an important constraint.
-
-Production controls should include:
-
-- request rate limits
-- tenant quotas
-- bounded worker concurrency
-- monitoring of event backlog
-- provider-aware concurrency limits
-- retry backoff
-- retry jitter
-
-The API should avoid allowing one noisy tenant to consume all available processing capacity.
-
----
-
-## 8. Noisy Tenant Isolation
-
-A tenant generating a disproportionate volume of events can create worker starvation.
-
-At larger scale, processing can be made fairer using:
-
-- per-tenant quotas
-- per-tenant rate limits
-- fair scheduling
-- tenant-specific concurrency limits
-
-These controls prevent one tenant from monopolizing worker capacity.
-
----
-
-## 9. Retry Storms
-
-Provider failures can increase workload because one event can result in multiple attempts.
-
-For example:
-
-```text
-initial attempt
-    ↓
-503
-    ↓
-retry
-    ↓
-429
-    ↓
-retry
-    ↓
-success
-```
-
-The implementation limits normal attempts to three and uses increasing backoff.
-
-At production scale, jitter should also be added to prevent synchronized retry waves.
-
-Metrics should track:
-
-- retry count
-- retry rate
-- provider status code
-- exhausted retries
-- retry delay
-- provider latency
-
----
-
-## 10. Hot Keys
-
-A single job may receive many versions rapidly.
-
-The job identity:
-
-```text
-tenantId + sourceId + externalJobId
-```
-
-can therefore become a hot document/key.
-
-Version-guarded updates prevent stale events from overwriting newer state.
-
-At much higher scale, workload distribution and MongoDB write contention should be measured before selecting a sharding strategy.
-
----
-
-## 11. Sharding
-
-If MongoDB becomes the scaling bottleneck, sharding can be considered.
-
-Potential shard-key candidates include tenant/source dimensions, but the correct shard key must be selected based on actual traffic distribution.
-
-Important considerations include:
-
-- tenant size distribution
-- hot tenants
-- query patterns
-- write distribution
-- cardinality
-- migration cost
-
-A poor shard key could concentrate traffic rather than distribute it.
-
----
-
-## 12. Retention
-
-Raw event history has a specified seven-day retention target at scale.
-
-A production implementation could use retention policies or archival storage for historical data depending on the final data-retention requirements.
-
-Current job projections should be retained independently from short-lived raw ingestion records because current jobs represent the latest state.
-
----
-
-## 13. Metrics
-
-Production monitoring should include:
-
-### Ingestion
-
-- events accepted/sec
-- HTTP 400 rate
-- HTTP 409 rate
-- HTTP 202 rate
-- ingestion latency
-
-### Processing
-
-- processing latency
-- accepted backlog
-- processing backlog
-- completed events
-- failed events
-- stale events
-- lease recoveries
-
-### Provider
-
-- success rate
-- 429 rate
-- 503 rate
-- 422 rate
-- retry rate
-- retry exhaustion
-- provider latency
-
-### MongoDB
-
-- write latency
-- query latency
-- connection pool utilization
-- disk utilization
-- index size
-- replication health
-
----
-
-## 14. When to Introduce a Broker
-
-The assignment explicitly keeps the runnable core free of Kafka, Redis, and managed queues.
-
-At higher scale, a broker becomes useful when requirements include:
-
-- very high burst absorption
-- independent consumer groups
-- partition-based ordering
-- durable stream replay
-- multiple downstream consumers
-- stronger queue isolation
-- decoupling ingestion from worker storage
-
-Kafka could then act as the event transport while MongoDB remains the durable current-state projection store.
-
-The broker should be introduced based on measured throughput and operational requirements rather than simply because the system has grown.
+The current **~3.9 events/sec local throughput** is therefore treated as the baseline from which subsequent optimizations can be measured.

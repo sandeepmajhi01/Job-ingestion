@@ -47,7 +47,7 @@ export async function createEventService(
       payload: existing.payload,
     };
 
-    if (JSON.stringify(existingData) === JSON.stringify(data)) {
+    if (eventsAreEqual(existingData, data)) {
       return {
         status: "replay",
         event: existing,
@@ -93,7 +93,7 @@ export async function createEventService(
         payload: concurrent.payload,
       };
 
-      if (JSON.stringify(concurrentData) === JSON.stringify(data)) {
+      if (eventsAreEqual(concurrentData, data)) {
         return {
           status: "replay",
           event: concurrent,

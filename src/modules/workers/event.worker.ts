@@ -42,7 +42,7 @@ export async function claimNextEvent() {
       },
     },
     {
-     
+
   sort: { createdAt: 1 },
   returnDocument: "after",
     },
@@ -60,6 +60,37 @@ export async function processNextEvent(): Promise<void> {
 
   const attemptStartedAt = new Date();
 
+  const completeEvent = async (
+    outcome: "success" | "retryable" | "permanent",
+    error?: string,
+  ): Promise<void> => {
+    await Event.updateOne(
+      { _id: event._id },
+      {
+        $set: {
+          status: outcome === "success" ? "completed" : "failed",
+          processedAt:
+            outcome === "success" ? new Date() : undefined,
+          ...(error ? { lastError: error } : {}),
+        },
+        $push: {
+          attemptHistory: {
+            attempt: event.attempts,
+            startedAt: attemptStartedAt,
+            finishedAt: new Date(),
+            outcome,
+            ...(error ? { error } : {}),
+          },
+        },
+        $unset: {
+          leaseUntil: 1,
+          claimedBy: 1,
+          nextAttemptAt: 1,
+        },
+      },
+    );
+  };
+
   try {
     const currentJob = await Job.findOne({
       tenantId: event.tenantId,
@@ -69,32 +100,11 @@ export async function processNextEvent(): Promise<void> {
 
     // Ignore stale or already-applied versions.
     if (currentJob && event.version <= currentJob.version) {
-      await Event.updateOne(
-        { _id: event._id },
-        {
-          $set: {
-            status: "completed",
-            processedAt: new Date(),
-          },
-          $push: {
-            attemptHistory: {
-              attempt: event.attempts,
-              startedAt: attemptStartedAt,
-              finishedAt: new Date(),
-              outcome: "success",
-            },
-          },
-          $unset: {
-            leaseUntil: 1,
-            claimedBy: 1,
-          },
-        },
-      );
-
+      await completeEvent("success");
       return;
     }
 
-    // Verify with external provider.
+    // Verify with provider.
     const providerResult = await verifyJob(
       event.eventId,
       event.attempts,
@@ -124,6 +134,7 @@ export async function processNextEvent(): Promise<void> {
             $unset: {
               leaseUntil: 1,
               claimedBy: 1,
+              nextAttemptAt: 1,
             },
           },
         );
@@ -135,28 +146,30 @@ export async function processNextEvent(): Promise<void> {
         BACKOFF_BASE_MS * 2 ** (event.attempts - 1);
 
       await Event.updateOne(
-  { _id: event._id },
-  {
-    $set: {
-      status: "completed",
-      processedAt: new Date(),
-    },
-    $push: {
-      attemptHistory: {
-        attempt: event.attempts,
-        startedAt: attemptStartedAt,
-        finishedAt: new Date(),
-        outcome: "success",
-      },
-    },
-    $unset: {
-      leaseUntil: 1,
-      claimedBy: 1,
-      nextAttemptAt: 1,
-      lastError: 1,
-    },
-  },
-);
+        { _id: event._id },
+        {
+          $set: {
+            status: "accepted",
+            nextAttemptAt: new Date(
+              Date.now() + backoffMs,
+            ),
+            lastError: providerResult.message,
+          },
+          $push: {
+            attemptHistory: {
+              attempt: event.attempts,
+              startedAt: attemptStartedAt,
+              finishedAt,
+              outcome: "retryable",
+              error: providerResult.message,
+            },
+          },
+          $unset: {
+            leaseUntil: 1,
+            claimedBy: 1,
+          },
+        },
+      );
 
       return;
     }
@@ -182,6 +195,7 @@ export async function processNextEvent(): Promise<void> {
           $unset: {
             leaseUntil: 1,
             claimedBy: 1,
+            nextAttemptAt: 1,
           },
         },
       );
@@ -191,87 +205,180 @@ export async function processNextEvent(): Promise<void> {
 
     // Provider succeeded.
     if (event.operation === "upsert") {
-      await Job.findOneAndUpdate(
-        {
-          tenantId: event.tenantId,
-          sourceId: event.sourceId,
-          externalJobId: event.externalJobId,
-          $or: [
-            { version: { $lt: event.version } },
-            { version: { $exists: false } },
-          ],
-        },
-        {
-          $set: {
+      try {
+        await Job.findOneAndUpdate(
+          {
             tenantId: event.tenantId,
             sourceId: event.sourceId,
             externalJobId: event.externalJobId,
-            version: event.version,
-            status: "active",
-            payload: event.payload,
+            $or: [
+              { version: { $lt: event.version } },
+              { version: { $exists: false } },
+            ],
           },
-        },
-        {
-          upsert: true,
-          new: true,
-        },
-      );
+          {
+            $set: {
+              tenantId: event.tenantId,
+              sourceId: event.sourceId,
+              externalJobId: event.externalJobId,
+              version: event.version,
+              status: "active",
+              payload: event.payload,
+            },
+          },
+          {
+            upsert: true,
+            returnDocument: "after",
+          },
+        );
+      } catch (error: unknown) {
+        /*
+         * Concurrent first-write race.
+         *
+         * Another worker may have created the same job between
+         * our initial read and this upsert.
+         */
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === 11000
+        ) {
+          const existingJob = await Job.findOne({
+            tenantId: event.tenantId,
+            sourceId: event.sourceId,
+            externalJobId: event.externalJobId,
+          });
+
+          if (!existingJob) {
+            throw error;
+          }
+
+          /*
+           * Another worker already installed an equal or newer
+           * version. Therefore this event is stale and can safely
+           * complete.
+           */
+          if (existingJob.version >= event.version) {
+            await completeEvent("success");
+            return;
+          }
+
+          /*
+           * The existing document has a lower version.
+           * Retry the conditional update without upsert.
+           */
+          await Job.findOneAndUpdate(
+            {
+              tenantId: event.tenantId,
+              sourceId: event.sourceId,
+              externalJobId: event.externalJobId,
+              version: {
+                $lt: event.version,
+              },
+            },
+            {
+              $set: {
+                version: event.version,
+                status: "active",
+                payload: event.payload,
+              },
+            },
+            {
+              returnDocument: "after",
+            },
+          );
+        } else {
+          throw error;
+        }
+      }
     }
 
     // Archive the job.
     if (event.operation === "archive") {
-      await Job.findOneAndUpdate(
-        {
-          tenantId: event.tenantId,
-          sourceId: event.sourceId,
-          externalJobId: event.externalJobId,
-          $or: [
-            { version: { $lt: event.version } },
-            { version: { $exists: false } },
-          ],
-        },
-        {
-          $set: {
+      try {
+        await Job.findOneAndUpdate(
+          {
             tenantId: event.tenantId,
             sourceId: event.sourceId,
             externalJobId: event.externalJobId,
-            version: event.version,
-            status: "archived",
+            $or: [
+              { version: { $lt: event.version } },
+              { version: { $exists: false } },
+            ],
           },
-          $unset: {
-            payload: 1,
+          {
+            $set: {
+              tenantId: event.tenantId,
+              sourceId: event.sourceId,
+              externalJobId: event.externalJobId,
+              version: event.version,
+              status: "archived",
+            },
+            $unset: {
+              payload: 1,
+            },
           },
-        },
-        {
-          upsert: true,
-          new: true,
-        },
-      );
+          {
+            upsert: true,
+            returnDocument: "after",
+          },
+        );
+      } catch (error: unknown) {
+        /*
+         * Same first-write race handling for archive events.
+         */
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === 11000
+        ) {
+          const existingJob = await Job.findOne({
+            tenantId: event.tenantId,
+            sourceId: event.sourceId,
+            externalJobId: event.externalJobId,
+          });
+
+          if (!existingJob) {
+            throw error;
+          }
+
+          if (existingJob.version >= event.version) {
+            await completeEvent("success");
+            return;
+          }
+
+          await Job.findOneAndUpdate(
+            {
+              tenantId: event.tenantId,
+              sourceId: event.sourceId,
+              externalJobId: event.externalJobId,
+              version: {
+                $lt: event.version,
+              },
+            },
+            {
+              $set: {
+                version: event.version,
+                status: "archived",
+              },
+              $unset: {
+                payload: 1,
+              },
+            },
+            {
+              returnDocument: "after",
+            },
+          );
+        } else {
+          throw error;
+        }
+      }
     }
 
     // Mark event as completed.
-    await Event.updateOne(
-      { _id: event._id },
-      {
-        $set: {
-          status: "completed",
-          processedAt: new Date(),
-        },
-        $push: {
-          attemptHistory: {
-            attempt: event.attempts,
-            startedAt: attemptStartedAt,
-            finishedAt: new Date(),
-            outcome: "success",
-          },
-        },
-        $unset: {
-          leaseUntil: 1,
-          claimedBy: 1,
-          nextAttemptAt: 1,
-        },
-      },
-    );
+    await completeEvent("success");
   } catch (error) {
     const message =
       error instanceof Error
@@ -297,6 +404,7 @@ export async function processNextEvent(): Promise<void> {
         $unset: {
           leaseUntil: 1,
           claimedBy: 1,
+          nextAttemptAt: 1,
         },
       },
     );
